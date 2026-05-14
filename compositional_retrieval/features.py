@@ -43,7 +43,7 @@ def load_or_extract_embeddings(
 
     if cache_path.exists():
         print(f"Found cached embeddings at {cache_path}")
-        data = torch.load(cache_path)
+        data = torch.load(cache_path, map_location=device)
         embeddings = data["embeddings"].to(device)
         labels = data["labels"]
         print(f"Loaded embeddings with shape: {tuple(embeddings.shape)}")
@@ -59,7 +59,7 @@ def load_or_extract_embeddings(
     print("Encoding completed.")
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"embeddings": embeddings, "labels": labels}, cache_path)
+    torch.save({"embeddings": embeddings.cpu(), "labels": labels}, cache_path)
     print(f"Saved embeddings to {cache_path}")
 
-    return embeddings.to(device), labels
+    return embeddings, labels

@@ -42,13 +42,13 @@ def encode_text(prompt: str, model, processor, device) -> torch.Tensor:
 
 
 @torch.no_grad()
-def encode_images(images, model, processor, device, batch_size: int = 128, to_cpu: bool = True) -> torch.Tensor:
+def encode_images(images, model, processor, device, batch_size: int = 128, to_cpu: bool = False) -> torch.Tensor:
     """Encode an iterable of PIL images. Returns (N, D), L2-normalized per row.
 
     Streams in `batch_size` chunks so callers don't have to hand-roll batching.
-    By default each batch is moved to CPU before being concatenated, which keeps
-    GPU memory bounded when encoding large datasets. Pass `to_cpu=False` to keep
-    the result on `device` (useful for single-image / small-batch calls).
+    The result stays on `device` so downstream tensor ops don't pay a CPU
+    roundtrip. Pass `to_cpu=True` if you're encoding a dataset that wouldn't
+    fit on the GPU and need to bound device memory.
     """
     feats: list[torch.Tensor] = []
     buf: list = []

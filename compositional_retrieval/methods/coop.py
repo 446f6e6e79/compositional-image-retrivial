@@ -110,42 +110,55 @@ class CoOpPromptLearner(nn.Module):
         return e_pos, e_neg
 
 
+@torch.no_grad()
 def macro_auc(logits: torch.Tensor, targets: torch.Tensor) -> float:
-    """Macro-averaged AUC over the 40 attributes, ignoring attributes with no positives or no negatives in the batch."""
-    logits = logits.detach().cpu().numpy()
-    targets = targets.detach().cpu().numpy()
-    aucs = []
+    """Macro-averaged AUC over the 40 attributes, ignoring attributes with no positives or no negatives in the batch.
+
+    Runs entirely on `logits.device`; only the final mean scalar is materialized on the host.
+    """
+    logits = logits.detach()
+    targets = targets.detach()
+    aucs: list[torch.Tensor] = []
+    n = targets.shape[0]
     for j in range(targets.shape[1]):
         y = targets[:, j]
-        if y.sum() == 0 or y.sum() == y.shape[0]:
+        n_pos = int(y.sum().item())
+        if n_pos == 0 or n_pos == n:
             continue
-        order = np.argsort(logits[:, j])
-        ranks = np.empty_like(order)
-        ranks[order] = np.arange(len(order))
+        n_neg = n - n_pos
+        # Mann-Whitney AUC via ranks (no sklearn dependency).
+        order = torch.argsort(logits[:, j])
+        ranks = torch.empty_like(order, dtype=torch.float32)
+        ranks[order] = torch.arange(n, device=order.device, dtype=torch.float32)
         pos_ranks = ranks[y == 1].sum()
-        n_pos = int(y.sum())
-        n_neg = len(y) - n_pos
         aucs.append((pos_ranks - n_pos * (n_pos - 1) / 2) / (n_pos * n_neg))
-    return float(np.mean(aucs)) if aucs else float("nan")
+    if not aucs:
+        return float("nan")
+    return float(torch.stack(aucs).mean())
 
 
 def _select_few_shot_subset(
     train_labels: torch.Tensor,
     k_shot: int = 16,
     seed: int = 42,
-) -> np.ndarray:
-    """16-shot per attribute (each polarity) from the training labels, deduplicated."""
-    rng = np.random.RandomState(seed)
-    train_labels_np = train_labels.numpy() if isinstance(train_labels, torch.Tensor) else train_labels
-    chosen: set[int] = set()
-    for j in range(train_labels_np.shape[1]):
-        pos_idxs = np.where(train_labels_np[:, j] == 1)[0]
-        neg_idxs = np.where(train_labels_np[:, j] == 0)[0]
-        if len(pos_idxs) > 0:
-            chosen.update(rng.choice(pos_idxs, size=min(k_shot, len(pos_idxs)), replace=False).tolist())
-        if len(neg_idxs) > 0:
-            chosen.update(rng.choice(neg_idxs, size=min(k_shot, len(neg_idxs)), replace=False).tolist())
-    return np.array(sorted(chosen))
+    device: str | torch.device = "cpu",
+) -> torch.Tensor:
+    """16-shot per attribute (each polarity) from the training labels, deduplicated.
+
+    Returns a 1-D tensor of unique sorted indices on `device`.
+    """
+    labels = train_labels.to(device) if isinstance(train_labels, torch.Tensor) else torch.as_tensor(train_labels, device=device)
+    generator = torch.Generator(device=device).manual_seed(seed)
+    chosen = torch.zeros(labels.shape[0], dtype=torch.bool, device=device)
+    for j in range(labels.shape[1]):
+        for value in (1, 0):
+            idxs = (labels[:, j] == value).nonzero(as_tuple=True)[0]
+            if idxs.numel() == 0:
+                continue
+            k = min(k_shot, int(idxs.numel()))
+            pick = idxs[torch.randperm(idxs.numel(), generator=generator, device=device)[:k]]
+            chosen[pick] = True
+    return chosen.nonzero(as_tuple=True)[0]
 
 
 def train_coop(
@@ -164,33 +177,36 @@ def train_coop(
     torch.manual_seed(42)
     np.random.seed(42)
 
+    train_features = train_features.to(device)
+    train_labels_dev = (
+        train_labels.to(device)
+        if isinstance(train_labels, torch.Tensor)
+        else torch.as_tensor(np.asarray(train_labels), device=device)
+    )
+
     if config == "colab":
-        selected = _select_few_shot_subset(train_labels, k_shot=16, seed=42)
+        selected = _select_few_shot_subset(train_labels_dev, k_shot=16, seed=42, device=device)
         train_feats_sel = train_features[selected]
-        train_labels_sel = (
-            train_labels[selected]
-            if isinstance(train_labels, torch.Tensor)
-            else torch.tensor(np.asarray(train_labels)[selected])
-        )
+        train_labels_sel = train_labels_dev[selected]
         epochs, batch, lr = 30, 64, 2e-3
         use_amp = False
     elif config == "vm":
         train_feats_sel = train_features
-        train_labels_sel = train_labels
+        train_labels_sel = train_labels_dev
         epochs, batch, lr = 10, 256, 2e-3
-        use_amp = (device == "cuda")
+        use_amp = (str(device) == "cuda")
     else:
         raise ValueError(f"Unknown CoOp config: {config}")
 
     N = train_feats_sel.shape[0]
-    perm = torch.randperm(N)
+    perm = torch.randperm(N, device=device)
     val_size = max(1, int(round(val_fraction * N)))
     val_idx = perm[:val_size]
     trn_idx = perm[val_size:]
-    X_tr = train_feats_sel[trn_idx].to(device)
-    Y_tr = train_labels_sel[trn_idx].float().to(device)
-    X_va = train_feats_sel[val_idx].to(device)
-    Y_va = train_labels_sel[val_idx].float().to(device)
+    X_tr = train_feats_sel[trn_idx]
+    Y_tr = train_labels_sel[trn_idx].float()
+    X_va = train_feats_sel[val_idx]
+    Y_va = train_labels_sel[val_idx].float()
 
     print(f"CoOp config: {config}  |  train: {tuple(X_tr.shape)}  val: {tuple(X_va.shape)}")
     print(f"epochs={epochs} batch={batch} lr={lr} M={M} amp={use_amp}")
